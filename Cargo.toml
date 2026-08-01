@@ -1,0 +1,15 @@
+[package]
+name = "repomgr"
+version = "0.1.0"
+edition = "2021"
+description = "A minimal TUI to manage the git repositories inside the current directory"
+license = "MIT OR Apache-2.0"
+
+# Only dependency: ratatui (its default crossterm backend is re-exported
+# through ratatui, so the program pulls in exactly one external crate).
+[dependencies]
+ratatui = "=0.27.0"
+
+[profile.release]
+lto = true
+strip = true
