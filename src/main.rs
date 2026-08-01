@@ -1,7 +1,7 @@
 //! repomgr — a tiny TUI for managing the git repositories in the current
 //! directory.
 //!
-//! Architecture (inspired by basilk):
+//! Architecture:
 //!   main.rs  app state + event loop + key handling
 //!   view.rs  all drawing (list/info panes, modals, help)
 //!   git.rs   shelling out to the `git` CLI

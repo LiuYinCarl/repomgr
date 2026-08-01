@@ -1,8 +1,6 @@
 # repomgr
 
-一个极简的 TUI 程序，用来管理当前目录下的所有 git 项目。参考
-[basilk](https://github.com/GabAlpha/basilk) 的架构和交互方式，从
-`manager_git_package.sh` 演化而来，但不再需要手改脚本里的仓库列表——启动时
+一个极简的 TUI 程序，用来管理当前目录下的所有 git 项目。启动时
 自动扫描你所在目录，交互式完成查看、更新、克隆等操作。
 
 <img width="1470" height="887" alt="image" src="https://github.com/user-attachments/assets/e058d3ae-cf8f-4d27-8916-a6d80611c607" />
@@ -75,8 +73,3 @@ src/git.rs   通过 Command 调用 git CLI：发现仓库、读取信息、updat
 ```
 
 每个模块职责单一，想改界面只动 `view.rs`，想加 git 操作只动 `git.rs`。
-
-## 与 manager_git_package.sh 的关系
-
-旧的 `manager_git_package.sh` 保留用于非交互/自动化场景（如 cron 里批量
-pull、备份）。日常管理仓库建议直接用 `repomgr`。
