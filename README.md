@@ -5,6 +5,9 @@
 `manager_git_package.sh` 演化而来，但不再需要手改脚本里的仓库列表——启动时
 自动扫描你所在目录，交互式完成查看、更新、克隆等操作。
 
+<img width="1470" height="887" alt="image" src="https://github.com/user-attachments/assets/e058d3ae-cf8f-4d27-8916-a6d80611c607" />
+
+
 ## 特性
 
 - 双栏主界面：左侧是项目列表，右侧实时显示选中项目的信息
