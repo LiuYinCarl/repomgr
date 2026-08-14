@@ -20,7 +20,9 @@ pub struct View;
 const HELP_KEYS: &[(&str, &str)] = &[
     ("↑ ↓ / j k", "select repository"),
     ("g / G", "first / last repository"),
-    ("u", "update selected repo (git pull --ff-only)"),
+    ("Space", "mark / unmark for batch update"),
+    ("A", "clear all marks"),
+    ("u", "update marked repos (or current one)"),
     ("s / Enter", "show git status"),
     ("b", "show recent commits"),
     ("l", "show local branches"),
@@ -33,7 +35,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
 ];
 
 const BROWSE_HINTS: &str =
-    "↑↓ j/k select · u update · s status · b log · l branches · n clone · o open · O remote · r rescan · R reload · h help · q quit";
+    "↑↓ j/k select · Space mark · u update · s status · b log · l branches · n clone · o open · O remote · r rescan · R reload · h help · q quit";
 
 impl View {
     pub fn draw(app: &App, f: &mut Frame) {
@@ -103,11 +105,27 @@ impl View {
         let items: Vec<ListItem> = app
             .repos
             .iter()
-            .map(|path| {
+            .enumerate()
+            .map(|(index, path)| {
                 let name = git::sanitize(&path.file_name().unwrap_or_default().to_string_lossy());
-                ListItem::new(name)
+                let marker = if app.marked.contains(&index) {
+                    Span::styled("● ", Style::default().fg(Color::Yellow))
+                } else {
+                    Span::raw("  ")
+                };
+                ListItem::new(Line::from(vec![marker, Span::raw(name)]))
             })
             .collect();
+
+        let title = if app.marked.is_empty() {
+            format!(" Repos ({}) ", app.repos.len())
+        } else {
+            format!(
+                " Repos ({} · {} marked) ",
+                app.repos.len(),
+                app.marked.len()
+            )
+        };
 
         let list = List::new(items)
             .highlight_style(
@@ -117,11 +135,7 @@ impl View {
             )
             .highlight_symbol("> ")
             .highlight_spacing(HighlightSpacing::Always)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(" Repos ({}) ", app.repos.len())),
-            );
+            .block(Block::default().borders(Borders::ALL).title(title));
 
         let mut state = ListState::default();
         state.select((!app.repos.is_empty()).then_some(app.selected));

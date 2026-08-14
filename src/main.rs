@@ -9,10 +9,10 @@
 mod git;
 mod view;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use ratatui::{
@@ -47,8 +47,22 @@ enum Mode {
 /// A git operation that the event loop runs synchronously (drawn first as a
 /// "working…" modal so the user sees that something is happening).
 enum PendingOp {
-    Update,
+    /// Single repository to update synchronously, captured when the
+    /// operation was started. Batch updates go through [`BatchUpdate`].
+    Update(PathBuf),
     Clone,
+}
+
+/// An in-flight concurrent batch update. A bounded pool of worker threads
+/// (sized like the prefetch workers) runs `git pull` for the targets and
+/// sends each result back with its original list index, so the final
+/// report keeps the list order regardless of completion order.
+struct BatchUpdate {
+    targets: Vec<PathBuf>,
+    rx: mpsc::Receiver<(usize, Result<String, String>)>,
+    /// Per-target result slot, filled as workers report back.
+    results: Vec<Option<Result<String, String>>>,
+    completed: usize,
 }
 
 /// What the event loop should do after a key was handled.
@@ -69,6 +83,12 @@ struct CacheEntry {
     mtime: Option<Vec<SystemTime>>,
 }
 
+/// Display name for a repository path: its directory name, sanitized.
+fn repo_name(path: &Path) -> String {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    git::sanitize(&name)
+}
+
 fn cache_entry(info: git::RepoInfo, manual: bool, path: &Path) -> CacheEntry {
     CacheEntry {
         info,
@@ -81,6 +101,9 @@ struct App {
     root: PathBuf,
     repos: Vec<PathBuf>,
     selected: usize,
+    /// Indices marked with Space for a batch update. Cleared on rescan
+    /// (indices would no longer match) and after an update.
+    marked: HashSet<usize>,
     /// Whether the initial directory scan has finished. The first frame is
     /// drawn before the scan so the screen never stays blank while git
     /// queries run at startup.
@@ -90,6 +113,8 @@ struct App {
     prev_mode: Mode,
     /// Operation waiting to run in the event loop, if any.
     pending: Option<PendingOp>,
+    /// Concurrent batch update in flight, if any.
+    batch: Option<BatchUpdate>,
     /// Background-prefetched info, keyed by repository path.
     cache: Arc<Mutex<HashMap<PathBuf, CacheEntry>>>,
     /// Clone URL input buffer.
@@ -108,10 +133,12 @@ impl App {
             root,
             repos: Vec::new(),
             selected: 0,
+            marked: HashSet::new(),
             scanned: false,
             mode: Mode::Browse,
             prev_mode: Mode::Browse,
             pending: None,
+            batch: None,
             cache: Arc::new(Mutex::new(HashMap::new())),
             input: String::new(),
             scroll: 0,
@@ -126,14 +153,12 @@ impl App {
     }
 
     fn current_name(&self) -> Option<String> {
-        self.current_path().map(|p| {
-            let name = p.file_name().unwrap_or_default().to_string_lossy();
-            git::sanitize(&name)
-        })
+        self.current_path().map(|p| repo_name(p))
     }
 
     fn rescan(&mut self) {
         self.repos = git::discover_repos(&self.root);
+        self.marked.clear();
         if self.repos.is_empty() {
             self.selected = 0;
             if let Ok(mut cache) = self.cache.lock() {
@@ -154,16 +179,21 @@ impl App {
         cache.get(path).map(|entry| entry.info.clone())
     }
 
-    /// Synchronously reload the selected repo and mark the cache entry as
+    /// Synchronously reload one repository and mark its cache entry as
     /// manually refreshed so the background worker leaves it alone.
+    fn manual_refresh(&mut self, path: &Path) {
+        let info = git::load_info(path);
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(path.to_path_buf(), cache_entry(info, true, path));
+        }
+    }
+
+    /// Manually refresh the selected repository.
     fn manual_refresh_current(&mut self) {
         let Some(path) = self.current_path().cloned() else {
             return;
         };
-        let info = git::load_info(&path);
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.insert(path.clone(), cache_entry(info, true, &path));
-        }
+        self.manual_refresh(&path);
     }
 
     /// Watch repositories for external changes (a `git pull`/`commit`/… in
@@ -283,33 +313,163 @@ impl App {
         self.scroll = 0;
     }
 
-    fn start_update(&mut self) {
-        let name = self.current_name().unwrap_or_default();
-        self.mode = Mode::Working;
-        self.status_msg = None;
-        self.modal_title = git::sanitize(&format!(" Updating {name} "));
-        self.modal_text = vec![
-            "running: git pull --ff-only".into(),
-            String::new(),
-            "please wait…".into(),
-        ];
-        self.scroll = 0;
-        self.pending = Some(PendingOp::Update);
+    /// Toggle the batch-update mark on the current repository and move to
+    /// the next row, so a range can be marked with repeated presses.
+    fn toggle_mark(&mut self) {
+        if self.repos.is_empty() {
+            return;
+        }
+        if !self.marked.insert(self.selected) {
+            self.marked.remove(&self.selected);
+        }
+        self.move_selection(1);
     }
 
-    fn finish_update(&mut self) {
-        let name = self.current_name().unwrap_or_default();
-        let result = self.current_path().map(|path| git::update_repo(path));
-        match result {
-            Some(Ok(output)) => {
-                self.open_text(Mode::UpdateResult, format!(" Updated {name} "), output)
-            }
-            Some(Err(err)) => {
-                self.open_text(Mode::UpdateResult, format!(" Update failed: {name} "), err)
-            }
-            None => self.mode = Mode::Browse,
+    fn start_update(&mut self) {
+        // Marked repositories take precedence; without marks, update the
+        // current row only.
+        let targets: Vec<PathBuf> = if self.marked.is_empty() {
+            self.current_path().cloned().into_iter().collect()
+        } else {
+            let mut indices: Vec<usize> = self.marked.iter().copied().collect();
+            indices.sort_unstable();
+            indices
+                .iter()
+                .filter_map(|&i| self.repos.get(i).cloned())
+                .collect()
+        };
+        if targets.is_empty() {
+            return;
         }
-        self.manual_refresh_current();
+        self.mode = Mode::Working;
+        self.status_msg = None;
+        self.scroll = 0;
+        if targets.len() == 1 {
+            // Single repository: keep the plain synchronous path.
+            self.modal_title = git::sanitize(&format!(" Updating {} ", repo_name(&targets[0])));
+            self.modal_text = vec![
+                "running: git pull --ff-only".into(),
+                String::new(),
+                "please wait…".into(),
+            ];
+            self.pending = Some(PendingOp::Update(targets.into_iter().next().unwrap()));
+        } else {
+            self.start_batch_update(targets);
+        }
+    }
+
+    /// Update several repositories concurrently on worker threads. The
+    /// event loop polls [`App::poll_batch`] for results and shows progress
+    /// in the working modal.
+    fn start_batch_update(&mut self, targets: Vec<PathBuf>) {
+        let total = targets.len();
+        self.modal_title = git::sanitize(&format!(" Updating {total} repositories "));
+        self.modal_text = vec![
+            "running: git pull --ff-only (concurrently)".into(),
+            String::new(),
+            format!("updated 0/{total} repositories…"),
+        ];
+
+        let (tx, rx) = mpsc::channel();
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(1, 8)
+            .min(total);
+        // Workers pull target indices from a shared counter until the
+        // list is exhausted.
+        let next = Arc::new(Mutex::new(0usize));
+        let shared = Arc::new(targets.clone());
+        for _ in 0..workers {
+            let tx = tx.clone();
+            let next = Arc::clone(&next);
+            let targets = Arc::clone(&shared);
+            std::thread::spawn(move || loop {
+                let index = {
+                    let mut next = next.lock().unwrap();
+                    if *next >= targets.len() {
+                        break;
+                    }
+                    let index = *next;
+                    *next += 1;
+                    index
+                };
+                let result = git::update_repo(&targets[index]);
+                if tx.send((index, result)).is_err() {
+                    // Receiver gone (app quit mid-batch): stop early.
+                    break;
+                }
+            });
+        }
+
+        self.batch = Some(BatchUpdate {
+            results: vec![None; targets.len()],
+            rx,
+            completed: 0,
+            targets,
+        });
+    }
+
+    /// Drain finished batch-update results. While workers are still
+    /// running this only refreshes the progress text; once all targets
+    /// have reported, it assembles the result modal in list order.
+    fn poll_batch(&mut self) {
+        let mut refreshed = Vec::new();
+        let (done, total) = {
+            let Some(batch) = &mut self.batch else {
+                return;
+            };
+            while let Ok((index, result)) = batch.rx.try_recv() {
+                refreshed.push(batch.targets[index].clone());
+                batch.results[index] = Some(result);
+                batch.completed += 1;
+            }
+            (batch.completed, batch.targets.len())
+        };
+        // Refresh finished repos after releasing the batch borrow.
+        for path in refreshed {
+            self.manual_refresh(&path);
+        }
+        if done < total {
+            self.modal_text = vec![
+                "running: git pull --ff-only (concurrently)".into(),
+                String::new(),
+                format!("updated {done}/{total} repositories…"),
+            ];
+            return;
+        }
+        let batch = self.batch.take().expect("batch finished above");
+        let mut failures = 0;
+        let mut sections = Vec::new();
+        for (path, result) in batch.targets.iter().zip(batch.results) {
+            let result = result.expect("all results collected");
+            if result.is_err() {
+                failures += 1;
+            }
+            let body = result.unwrap_or_else(|err| err);
+            sections.push(format!("== {} ==\n{body}", repo_name(path)));
+        }
+        let title = if failures == 0 {
+            format!(" Updated {} repositories ", batch.targets.len())
+        } else {
+            format!(
+                " Updated {} repositories ({} failed) ",
+                batch.targets.len(),
+                failures
+            )
+        };
+        self.open_text(Mode::UpdateResult, title, sections.join("\n\n"));
+        self.marked.clear();
+    }
+
+    fn finish_update(&mut self, path: &Path) {
+        let name = repo_name(path);
+        match git::update_repo(path) {
+            Ok(output) => self.open_text(Mode::UpdateResult, format!(" Updated {name} "), output),
+            Err(err) => self.open_text(Mode::UpdateResult, format!(" Update failed: {name} "), err),
+        }
+        self.manual_refresh(path);
+        self.marked.clear();
     }
 
     fn start_clone(&mut self) {
@@ -379,10 +539,21 @@ impl App {
                 self.select_index(self.repos.len().saturating_sub(1));
                 KeyAction::None
             }
-            KeyCode::Char('u') => {
-                if self.current_path().is_some() {
-                    self.start_update();
+            KeyCode::Char(' ') => {
+                self.toggle_mark();
+                KeyAction::None
+            }
+            KeyCode::Char('A') => {
+                if self.marked.is_empty() {
+                    self.status_msg = Some("no marks to clear".into());
+                } else {
+                    self.marked.clear();
+                    self.status_msg = Some("marks cleared".into());
                 }
+                KeyAction::None
+            }
+            KeyCode::Char('u') => {
+                self.start_update();
                 KeyAction::None
             }
             KeyCode::Char('s') | KeyCode::Enter => self.show_status(),
@@ -584,9 +755,12 @@ impl App {
                 // slow git operation, so the UI gives feedback first.
                 terminal.draw(|f| View::draw(self, f))?;
                 match op {
-                    PendingOp::Update => self.finish_update(),
+                    PendingOp::Update(path) => self.finish_update(&path),
                     PendingOp::Clone => self.finish_clone(),
                 }
+            }
+            if self.batch.is_some() {
+                self.poll_batch();
             }
         }
         Ok(())
@@ -627,4 +801,120 @@ fn main() -> io::Result<()> {
     let terminal = init_terminal()?;
     let mut app = App::new(root);
     app.run(terminal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("repomgr-main-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn init_src(dir: &Path) {
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main", "."]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("f.txt"), "hi").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+    }
+
+    fn clone_into(root: &Path, src: &Path, name: &str) {
+        let out = std::process::Command::new("git")
+            .args(["clone", "-q", src.to_str().unwrap(), name])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git clone failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A root with clones of a source repo living outside the root, so
+    /// `git pull --ff-only` has an upstream and succeeds.
+    fn make_root(tag: &str, names: &[&str]) -> (PathBuf, PathBuf) {
+        let src = temp_dir(&format!("{tag}-src"));
+        init_src(&src);
+        let root = temp_dir(tag);
+        for name in names {
+            clone_into(&root, &src, name);
+        }
+        (root, src)
+    }
+
+    #[test]
+    fn batch_update_pulls_all_marked_repos() {
+        let (root, src) = make_root("batch", &["a", "b", "c"]);
+        let mut app = App::new(root.clone());
+        app.rescan();
+        assert_eq!(app.repos.len(), 3);
+        app.marked.extend(0..3);
+
+        app.start_update();
+        assert!(app.batch.is_some(), "multi-target update should batch");
+        assert!(app.pending.is_none(), "batch must not use the sync path");
+
+        for _ in 0..1000 {
+            app.poll_batch();
+            if app.batch.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.batch.is_none(), "batch should finish within 10s");
+        assert_eq!(app.mode, Mode::UpdateResult);
+
+        // The report keeps one section per repo, in list order.
+        let text = app.modal_text.join("\n");
+        let mut last = 0;
+        for name in ["a", "b", "c"] {
+            let at = text
+                .find(&format!("== {name} =="))
+                .unwrap_or_else(|| panic!("missing section for {name}: {text}"));
+            assert!(at >= last, "sections out of order: {text}");
+            last = at;
+        }
+        assert!(app.marked.is_empty(), "marks are consumed by the update");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn single_update_stays_synchronous() {
+        let (root, src) = make_root("single", &["a"]);
+        let mut app = App::new(root.clone());
+        app.rescan();
+
+        app.start_update();
+        assert!(app.batch.is_none(), "single update must not batch");
+        let Some(PendingOp::Update(path)) = app.pending.take() else {
+            panic!("single update should use the sync pending path");
+        };
+
+        app.finish_update(&path);
+        assert_eq!(app.mode, Mode::UpdateResult);
+        assert!(app.modal_title.contains("Updated a"));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&src);
+    }
 }
